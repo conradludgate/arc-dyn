@@ -15,11 +15,8 @@
 //!
 //! // aliases
 //! type DynNode = Node<dyn Future<Output = ()> + Send + Sync + 'static>;
-//! type PinQueueTypes = dyn pin_queue::Types<
-//!     Id = pin_queue::id::Checked,
-//!     Node = DynNode,
-//! >;
-//! type PinQueue = pin_queue::PinQueue<PinQueueTypes, ThinArc<DynNode>, Key>;
+//! type PinQueueTypes = dyn pin_queue::Types<Id = pin_queue::id::Checked, Key = Key, Pointer = ThinArc<DynNode>>;
+//! type PinQueue = pin_queue::PinQueue<PinQueueTypes>;
 //!
 //! // our node type that stores the intrusive pointers and our value
 //! pin_project_lite::pin_project! (
@@ -83,16 +80,16 @@ use std::{
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
-use pin_queue::{Pointer, Types};
+use pin_queue::Pointer;
 
 use crate::{header::WithOpaqueHeader, ThinArc};
 
-impl<T: ?Sized + Types> Pointer<T> for ThinArc<T::Node> {
-    fn into_raw(self) -> *const T::Node {
+impl<T: ?Sized + 'static> Pointer for ThinArc<T> {
+    fn into_raw(self) -> *const T {
         ThinArc::into_raw(self)
     }
 
-    unsafe fn from_raw(p: *const T::Node) -> Self {
+    unsafe fn from_raw(p: *const T) -> Self {
         // SAFETY: guaranteed by caller
         unsafe { ThinArc::from_raw(p) }
     }
@@ -202,8 +199,9 @@ mod tests {
 
     // aliases
     type DynNode = Node<dyn Future<Output = ()> + Send + Sync + 'static>;
-    type PinQueueTypes = dyn pin_queue::Types<Id = pin_queue::id::Checked, Node = DynNode>;
-    type PinQueue = pin_queue::PinQueue<PinQueueTypes, ThinArc<DynNode>, Key>;
+    type PinQueueTypes =
+        dyn pin_queue::Types<Id = pin_queue::id::Checked, Key = Key, Pointer = ThinArc<DynNode>>;
+    type PinQueue = pin_queue::PinQueue<PinQueueTypes>;
 
     // our node type that stores the intrusive pointers and our value
     pin_project_lite::pin_project!(
