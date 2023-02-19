@@ -18,7 +18,7 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::{PhantomData, Unpin};
-use core::mem::{self, align_of_val_raw};
+use core::mem;
 use core::ops::Deref;
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
@@ -28,8 +28,10 @@ use std::marker::Unsize;
 use std::process::abort;
 use std::ptr::{DynMetadata, Pointee};
 
-use alloc::alloc::Layout;
-use alloc::boxed::Box;
+use header::{WithHeader, WithOpaqueHeader};
+
+mod header;
+pub mod pin_queue;
 
 /// A soft limit on the amount of references that may be made to an `Arc`.
 ///
@@ -45,48 +47,31 @@ macro_rules! acquire {
 
 /// A thread-safe reference-counting pointer. 'Arc' stands for 'Atomically
 /// Reference Counted'.
-pub struct ThinArc<H, T: ?Sized>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
-    ptr: NonNull<ArcInner<H, T, ()>>,
-    phantom: PhantomData<T>,
+pub struct ThinArc<T: ?Sized> {
+    // This is essentially `WithHeader<ArcHeader<<T as Pointee>::Metadata>>`,
+    // but that would be invariant in `T`, and we want covariance.
+    pub(crate) ptr: WithOpaqueHeader,
+    _marker: PhantomData<T>,
 }
 
-unsafe impl<H, T: ?Sized + Sync + Send> Send for ThinArc<H, T> where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>
-{
-}
+unsafe impl<T: ?Sized + Sync + Send> Send for ThinArc<T> {}
+unsafe impl<T: ?Sized + Sync + Send> Sync for ThinArc<T> {}
 
-unsafe impl<H, T: ?Sized + Sync + Send> Sync for ThinArc<H, T> where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>
-{
-}
-
-// This is repr(C) to future-proof against possible field-reordering, which
-// would interfere with otherwise safe [into|from]_raw() of transmutable
-// inner types.
-#[repr(C)]
-struct ArcInner<H, T: ?Sized, U> {
-    header: ArcHeader<DynMetadata<T>>,
-    core: Core<H, U>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Core<H, T: ?Sized> {
-    pub header: H,
-    pub trailer: T,
-}
+// // This is repr(C) to future-proof against possible field-reordering, which
+// // would interfere with otherwise safe [into|from]_raw() of transmutable
+// // inner types.
+// #[repr(C)]
+// struct ArcInner<H, T: ?Sized, U> {
+//     header: ArcHeader<DynMetadata<T>>,
+//     core: Core<H, U>,
+// }
 
 struct ArcHeader<H> {
     strong: atomic::AtomicUsize,
     metadata: H,
 }
 
-impl<H, T: ?Sized> ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized> ThinArc<T> {
     /// Constructs a new `Arc<T>`.
     ///
     /// # Examples
@@ -99,41 +84,48 @@ where
 
     #[inline]
 
-    pub fn new<U: Unsize<T>>(header: H, trailer: U) -> ThinArc<H, T> {
-        let core = Core { header, trailer };
-        // Start the weak pointer count as 1 which is the weak pointer that's
-        // held by all the strong pointers (kinda), see std/rc.rs for more info
-        let x: Box<_> = Box::new(ArcInner {
-            header: ArcHeader {
-                strong: atomic::AtomicUsize::new(1),
-                metadata: ptr::metadata(&core as &Core<H, T>),
-            },
-            core,
-        });
-        Self {
-            ptr: NonNull::from(Box::leak(x)).cast(),
-            phantom: PhantomData,
+    pub fn new<U: Unsize<T>>(value: U) -> ThinArc<T> {
+        let header = ArcHeader {
+            metadata: ptr::metadata(&value as &T),
+            strong: atomic::AtomicUsize::new(1),
+        };
+        let ptr = WithOpaqueHeader::new(header, value);
+        ThinArc {
+            ptr,
+            _marker: PhantomData,
         }
     }
 
     /// Constructs a new `Pin<Arc<T>>`. If `T` does not implement `Unpin`, then
     /// `data` will be pinned in memory and unable to be moved.
     #[must_use]
-    pub fn pin<U: Unsize<T>>(header: H, data: U) -> Pin<ThinArc<H, T>> {
-        unsafe { Pin::new_unchecked(ThinArc::new(header, data)) }
+    pub fn pin<U: Unsize<T>>(value: U) -> Pin<ThinArc<T>> {
+        unsafe { Pin::new_unchecked(ThinArc::new(value)) }
     }
 }
 
-impl<H, T: ?Sized> ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized> ThinArc<T> {
+    fn meta(&self) -> <T as Pointee>::Metadata {
+        //  Safety:
+        //  -   NonNull and valid.
+        unsafe { *ptr::addr_of!((*self.with_header().header()).metadata) }
+    }
+
+    fn data(&self) -> *mut u8 {
+        self.with_header().value()
+    }
+
+    fn with_header(&self) -> &WithHeader<ArcHeader<<T as Pointee>::Metadata>> {
+        // SAFETY: both types are transparent to `NonNull<u8>`
+        unsafe { &*((&self.ptr) as *const WithOpaqueHeader as *const WithHeader<_>) }
+    }
+
     /// Consumes the `ThinArc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `ThinArc` using
     /// [`ThinArc::from_raw`].
     #[must_use = "losing the pointer will leak memory"]
-    pub fn into_raw(this: Self) -> *const Core<H, T> {
+    pub fn into_raw(this: Self) -> *const T {
         let ptr = Self::as_ptr(&this);
         mem::forget(this);
         ptr
@@ -144,16 +136,10 @@ where
     /// The counts are not affected in any way and the `ThinArc` is not consumed. The pointer is valid for
     /// as long as there are strong counts in the `ThinArc`.
     #[must_use]
-    pub fn as_ptr(this: &Self) -> *const Core<H, T> {
-        let metadata = unsafe { *ptr::addr_of!((*this.ptr.as_ptr()).header.metadata) };
-        unsafe {
-            let offset = data_offset_align::<T>(metadata.align_of());
-
-            // Reverse the offset to find the original ArcInner.
-            let data_ptr = (this.ptr.as_ptr() as *const _ as *const ()).byte_add(offset);
-
-            ptr::from_raw_parts(data_ptr, metadata)
-        }
+    pub fn as_ptr(this: &Self) -> *const T {
+        let value = this.data();
+        let metadata = this.meta();
+        ptr::from_raw_parts(value as *const (), metadata)
     }
 
     /// Constructs an `ThinArc<T>` from a raw pointer.
@@ -174,17 +160,10 @@ where
     ///
     /// [into_raw]: ThinArc::into_raw
     /// [transmute]: core::mem::transmute
-    pub unsafe fn from_raw(ptr: *const Core<H, T>) -> Self {
-        unsafe {
-            let offset = data_offset(ptr);
-
-            // Reverse the offset to find the original ArcInner.
-            let arc_ptr = ptr.byte_sub(offset) as *mut ArcInner<H, T, ()>;
-
-            Self {
-                ptr: NonNull::new_unchecked(arc_ptr),
-                phantom: PhantomData,
-            }
+    pub unsafe fn from_raw(ptr: *const T) -> Self {
+        Self {
+            ptr: WithOpaqueHeader(NonNull::new_unchecked(ptr.cast_mut().cast())),
+            _marker: PhantomData,
         }
     }
 
@@ -198,43 +177,19 @@ where
     #[inline]
     #[must_use]
     pub fn strong_count(this: &Self) -> usize {
-        this.inner().header.strong.load(Acquire)
+        this.header().strong.load(Acquire)
     }
 
     #[inline]
-    fn inner(&self) -> &ArcInner<H, T, ()> {
-        // This unsafety is ok because while this arc is alive we're guaranteed
-        // that the inner pointer is valid. Furthermore, we know that the
-        // `ArcInner` structure itself is `Sync` because the inner data is
-        // `Sync` as well, so we're ok loaning out an immutable pointer to these
-        // contents.
-        unsafe { self.ptr.as_ref() }
+    fn header(&self) -> &ArcHeader<<T as Pointee>::Metadata> {
+        unsafe { &*self.with_header().header() }
     }
 
     // Non-inlined part of `drop`.
     #[inline(never)]
     unsafe fn drop_slow(&mut self) {
-        // Destroy the data at this time, even though we must not free the box
-        // allocation itself.
-        let metadata = unsafe { *ptr::addr_of!((*self.ptr.as_ptr()).header.metadata) };
-        unsafe {
-            let offset = data_offset_align::<T>(metadata.align_of());
-
-            // Reverse the offset to find the original ArcInner.
-            let data_ptr = (self.ptr.as_ptr() as *mut _ as *mut ()).byte_add(offset);
-
-            ptr::drop_in_place(ptr::from_raw_parts_mut::<Core<H, T>>(data_ptr, metadata));
-        }
-        unsafe {
-            alloc::alloc::dealloc(
-                self.ptr.as_ptr().cast(),
-                Layout::for_value_raw(self.ptr.as_ptr())
-                    .extend(metadata.layout())
-                    .unwrap()
-                    .0
-                    .pad_to_align(),
-            )
-        }
+        let ptr = Self::as_ptr(self);
+        self.with_header().drop::<T>(ptr.cast_mut());
     }
 
     /// Returns `true` if the two `ThinArc`s point to the same allocation in a vein similar to
@@ -244,31 +199,22 @@ where
     #[inline]
     #[must_use]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+        this.ptr.0.as_ptr() == other.ptr.0.as_ptr()
     }
 }
 
-impl<H, T: ?Sized> Deref for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
-    type Target = Core<H, T>;
+impl<T: ?Sized> Deref for ThinArc<T> {
+    type Target = T;
 
-    #[inline]
-    fn deref(&self) -> &Core<H, T> {
-        let metadata = unsafe { self.ptr.as_ref().header.metadata };
-        unsafe {
-            let offset = data_offset_align::<T>(metadata.align_of());
-            let data_ptr = (self.ptr.as_ptr() as *const _ as *const ()).byte_add(offset);
-            &*ptr::from_raw_parts(data_ptr, metadata)
-        }
+    fn deref(&self) -> &T {
+        let value = self.data();
+        let metadata = self.meta();
+        let pointer = ptr::from_raw_parts(value as *const (), metadata);
+        unsafe { &*pointer }
     }
 }
 
-impl<H, T: ?Sized> Drop for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized> Drop for ThinArc<T> {
     /// Drops the `ThinArc`.
     ///
     /// This will decrement the strong reference count. If the strong reference
@@ -278,7 +224,7 @@ where
         // Because `fetch_sub` is already atomic, we do not need to synchronize
         // with other threads unless we are going to delete the object. This
         // same logic applies to the below `fetch_sub` to the `weak` count.
-        if self.inner().header.strong.fetch_sub(1, Release) != 1 {
+        if self.header().strong.fetch_sub(1, Release) != 1 {
             return;
         }
 
@@ -318,10 +264,7 @@ where
     }
 }
 
-impl<H, T: ?Sized> Clone for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized> Clone for ThinArc<T> {
     #[inline]
     fn clone(&self) -> Self {
         // Using a relaxed ordering is alright here, as knowledge of the
@@ -335,7 +278,7 @@ where
         // another must already provide any required synchronization.
         //
         // [1]: (www.boost.org/doc/libs/1_55_0/doc/html/atomic/usage_examples.html)
-        let old_size = self.inner().header.strong.fetch_add(1, Relaxed);
+        let old_size = self.header().strong.fetch_add(1, Relaxed);
 
         // However we need to guard against massive refcounts in case someone is `mem::forget`ing
         // Arcs. If we don't do this the count can overflow and users will use-after free. This
@@ -353,27 +296,19 @@ where
 
         ThinArc {
             ptr: self.ptr,
-            phantom: PhantomData,
+            _marker: PhantomData,
         }
     }
 }
 
-impl<H, T: ?Sized> PartialEq for ThinArc<H, T>
-where
-    Core<H, T>: PartialEq,
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized + PartialEq> PartialEq for ThinArc<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         **self == **other
     }
 }
 
-impl<H, T: ?Sized> PartialOrd for ThinArc<H, T>
-where
-    Core<H, T>: PartialOrd,
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized + PartialOrd> PartialOrd for ThinArc<T> {
     /// Partial comparison for two `ThinArc`s.
     ///
     /// The two are compared by calling `partial_cmp()` on their inner values.
@@ -382,11 +317,7 @@ where
     }
 }
 
-impl<H, T: ?Sized> Ord for ThinArc<H, T>
-where
-    Core<H, T>: Ord,
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized + Ord> Ord for ThinArc<T> {
     /// Comparison for two `ThinArc`s.
     ///
     /// The two are compared by calling `cmp()` on their inner values.
@@ -395,83 +326,45 @@ where
     }
 }
 
-impl<H, T: ?Sized> Eq for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-    Core<H, T>: Eq,
-{
+impl<T: ?Sized + Eq> Eq for ThinArc<T> {}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for ThinArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
 }
 
-impl<H, T: ?Sized> fmt::Debug for ThinArc<H, T>
-where
-    Core<H, T>: fmt::Debug,
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized + fmt::Debug> fmt::Debug for ThinArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<H, T: ?Sized> fmt::Pointer for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
+impl<T: ?Sized> fmt::Pointer for ThinArc<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&(&**self as *const Core<H, T>), f)
+        fmt::Pointer::fmt(&(&**self as *const T), f)
     }
 }
 
-impl<H, T: ?Sized> Hash for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-    Core<H, T>: Hash,
-{
+impl<T: ?Sized + Hash> Hash for ThinArc<T> {
     fn hash<H1: Hasher>(&self, state: &mut H1) {
         (**self).hash(state)
     }
 }
 
-impl<H, T: ?Sized> borrow::Borrow<Core<H, T>> for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
-    fn borrow(&self) -> &Core<H, T> {
+impl<T: ?Sized> borrow::Borrow<T> for ThinArc<T> {
+    fn borrow(&self) -> &T {
         self
     }
 }
 
-impl<H, T: ?Sized> AsRef<Core<H, T>> for ThinArc<H, T>
-where
-    Core<H, T>: Pointee<Metadata = DynMetadata<T>>,
-{
-    fn as_ref(&self) -> &Core<H, T> {
+impl<T: ?Sized> AsRef<T> for ThinArc<T> {
+    fn as_ref(&self) -> &T {
         self
     }
 }
 
-impl<H, T: ?Sized> Unpin for ThinArc<H, T> where Core<H, T>: Pointee<Metadata = DynMetadata<T>> {}
-
-/// Get the offset within an `ArcInner` for the payload behind a pointer.
-///
-/// # Safety
-///
-/// The pointer must point to (and have valid metadata for) a previously
-/// valid instance of T, but the T is allowed to be dropped.
-unsafe fn data_offset<H, T: ?Sized>(ptr: *const Core<H, T>) -> usize {
-    // Align the unsized value to the end of the ArcInner.
-    // Because RcBox is repr(C), it will always be the last field in memory.
-    // SAFETY: since the only unsized types possible are slices, trait objects,
-    // and extern types, the input safety requirement is currently enough to
-    // satisfy the requirements of align_of_val_raw; this is an implementation
-    // detail of the language that must not be relied upon outside of std.
-    unsafe { data_offset_align::<T>(align_of_val_raw(ptr)) }
-}
-
-#[inline]
-fn data_offset_align<T: ?Sized>(align: usize) -> usize {
-    let layout = Layout::new::<ArcHeader<DynMetadata<T>>>();
-    layout.size() + layout.padding_needed_for(align)
-}
+impl<T: ?Sized> Unpin for ThinArc<T> where T: Pointee<Metadata = DynMetadata<T>> {}
 
 #[cfg(test)]
 mod tests {
@@ -481,31 +374,31 @@ mod tests {
 
     #[test]
     fn clone_works() {
-        let x: ThinArc<(), dyn Display> = ThinArc::new((), 1usize);
+        let x: ThinArc<dyn Display> = ThinArc::new(1usize);
         let y = x.clone();
 
         drop(x);
-        assert_eq!(y.trailer.to_string(), "1");
+        assert_eq!(y.to_string(), "1");
     }
 
     #[test]
     fn many_types() {
-        let mut x: ThinArc<(), dyn Display>;
+        let mut x: ThinArc<dyn Display>;
 
-        x = ThinArc::new((), 1usize);
-        assert_eq!(x.trailer.to_string(), "1");
+        x = ThinArc::new(1usize);
+        assert_eq!(x.to_string(), "1");
 
-        x = ThinArc::new((), "hello");
-        assert_eq!(x.trailer.to_string(), "hello");
+        x = ThinArc::new("hello");
+        assert_eq!(x.to_string(), "hello");
 
-        x = ThinArc::new((), true);
-        assert_eq!(x.trailer.to_string(), "true");
+        x = ThinArc::new(true);
+        assert_eq!(x.to_string(), "true");
     }
 
     #[test]
     fn single_width() {
         assert_eq!(
-            std::mem::size_of::<ThinArc<(), dyn Display>>(),
+            std::mem::size_of::<ThinArc<dyn Display>>(),
             std::mem::size_of::<*const ()>()
         );
     }
@@ -520,7 +413,7 @@ mod tests {
         }
         let mut drop_count = 0;
         {
-            let x: ThinArc<(), dyn Send> = ThinArc::new((), Count(&mut drop_count));
+            let x: ThinArc<dyn Send> = ThinArc::new(Count(&mut drop_count));
             let _y = x.clone();
             let _z = x.clone();
         }

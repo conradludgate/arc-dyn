@@ -6,3 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+pin-queue = { git = "https://github.com/conradludgate/pin-queue" }
+
+[dev-dependencies]
+pin-lock = { git = "https://github.com/conradludgate/pin-lock" }
+pin-project-lite = "0.2"
+once_cell = "1"
