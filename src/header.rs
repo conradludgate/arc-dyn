@@ -1,4 +1,4 @@
-//! headers taken from https://doc.rust-lang.org/src/alloc/boxed/thin.rs.html
+//! headers taken from <https://doc.rust-lang.org/src/alloc/boxed/thin.rs.html>.
 
 use std::{
     alloc::{self, Layout, LayoutError},

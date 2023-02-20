@@ -1,17 +1,7 @@
 //! Thread-safe reference-counting thin-pointers to dyn data.
 //!
-//! See the [`Arc<T>`][Arc] documentation for more details.
-#![feature(
-    unsize,
-    layout_for_ptr,
-    alloc_layout_extra,
-    pointer_byte_offsets,
-    slice_ptr_get,
-    nonnull_slice_from_raw_parts,
-    set_ptr_value,
-    ptr_metadata
-)]
-extern crate alloc;
+//! See the [`ThinArc<T>`][ThinArc] documentation for more details.
+#![feature(unsize, layout_for_ptr, alloc_layout_extra, ptr_metadata)]
 
 use core::borrow;
 use core::cmp::Ordering;
@@ -26,7 +16,7 @@ use core::sync::atomic;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::marker::Unsize;
 use std::process::abort;
-use std::ptr::{DynMetadata, Pointee};
+use std::ptr::Pointee;
 
 use header::{WithHeader, WithOpaqueHeader};
 
@@ -57,33 +47,14 @@ pub struct ThinArc<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for ThinArc<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for ThinArc<T> {}
 
-// // This is repr(C) to future-proof against possible field-reordering, which
-// // would interfere with otherwise safe [into|from]_raw() of transmutable
-// // inner types.
-// #[repr(C)]
-// struct ArcInner<H, T: ?Sized, U> {
-//     header: ArcHeader<DynMetadata<T>>,
-//     core: Core<H, U>,
-// }
-
 struct ArcHeader<H> {
     strong: atomic::AtomicUsize,
     metadata: H,
 }
 
 impl<T: ?Sized> ThinArc<T> {
-    /// Constructs a new `Arc<T>`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    ///
-    /// let five = Arc::new(5);
-    /// ```
-
+    /// Constructs a new `ThinArc<T>`
     #[inline]
-
     pub fn new<U: Unsize<T>>(value: U) -> ThinArc<T> {
         let header = ArcHeader {
             metadata: ptr::metadata(&value as &T),
@@ -96,8 +67,8 @@ impl<T: ?Sized> ThinArc<T> {
         }
     }
 
-    /// Constructs a new `Pin<Arc<T>>`. If `T` does not implement `Unpin`, then
-    /// `data` will be pinned in memory and unable to be moved.
+    /// Constructs a new `Pin<ThinArc<T>>`. If `T` does not implement `Unpin`, then
+    /// `value` will be pinned in memory and unable to be moved.
     #[must_use]
     pub fn pin<U: Unsize<T>>(value: U) -> Pin<ThinArc<T>> {
         unsafe { Pin::new_unchecked(ThinArc::new(value)) }
@@ -144,22 +115,8 @@ impl<T: ?Sized> ThinArc<T> {
 
     /// Constructs an `ThinArc<T>` from a raw pointer.
     ///
-    /// The raw pointer must have been previously returned by a call to
-    /// [`ThinArc<U>::into_raw`][into_raw] where `U` must have the same size and
-    /// alignment as `T`. This is trivially true if `U` is `T`.
-    /// Note that if `U` is not `T` but has the same size and alignment, this is
-    /// basically like transmuting references of different types. See
-    /// [`mem::transmute`][transmute] for more information on what
-    /// restrictions apply in this case.
-    ///
-    /// The user of `from_raw` has to make sure a specific value of `T` is only
-    /// dropped once.
-    ///
-    /// This function is unsafe because improper use may lead to memory unsafety,
-    /// even if the returned `ThinArc<T>` is never accessed.
-    ///
-    /// [into_raw]: ThinArc::into_raw
-    /// [transmute]: core::mem::transmute
+    /// # Safety
+    /// Must be produced from a [`ThinArc::into_raw`] call
     pub unsafe fn from_raw(ptr: *const T) -> Self {
         Self {
             ptr: WithOpaqueHeader(NonNull::new_unchecked(ptr.cast_mut().cast())),
@@ -309,18 +266,12 @@ impl<T: ?Sized + PartialEq> PartialEq for ThinArc<T> {
 }
 
 impl<T: ?Sized + PartialOrd> PartialOrd for ThinArc<T> {
-    /// Partial comparison for two `ThinArc`s.
-    ///
-    /// The two are compared by calling `partial_cmp()` on their inner values.
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         (**self).partial_cmp(&**other)
     }
 }
 
 impl<T: ?Sized + Ord> Ord for ThinArc<T> {
-    /// Comparison for two `ThinArc`s.
-    ///
-    /// The two are compared by calling `cmp()` on their inner values.
     fn cmp(&self, other: &Self) -> Ordering {
         (**self).cmp(&**other)
     }
@@ -364,7 +315,7 @@ impl<T: ?Sized> AsRef<T> for ThinArc<T> {
     }
 }
 
-impl<T: ?Sized> Unpin for ThinArc<T> where T: Pointee<Metadata = DynMetadata<T>> {}
+impl<T: ?Sized> Unpin for ThinArc<T> {}
 
 #[cfg(test)]
 mod tests {
