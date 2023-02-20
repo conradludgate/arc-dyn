@@ -56,12 +56,14 @@ static QUEUE: Lazy<Mutex<PinQueue>> = Lazy::new(|| {
 });
 
 
-// spawn some tasks into the queue
-let task1 = ThinArc::pin(Task::new(async { println!("1"); }));
-QUEUE.lock().unwrap().push_back(task1).unwrap();
+// allocate the intrusive task and push it to the queue
+fn spawn(fut: impl Future<Output = ()> + Send + Sync + 'static) {
+    let task = ThinArc::pin(Task::new(fut));
+    QUEUE.lock().unwrap().push_back(task).unwrap();
+}
 
-let task2 = ThinArc::pin(Task::new(async { println!("2"); }));
-QUEUE.lock().unwrap().push_back(task2).unwrap();
+spawn(async { println!("1"); });
+spawn(async { println!("2"); });
 
 
 // If tasks are awoken, they get inserted to the back of the queue
