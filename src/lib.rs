@@ -371,3 +371,77 @@ mod tests {
         assert_eq!(drop_count, 1);
     }
 }
+
+#[cfg(test)]
+mod tests2 {
+    use crate::ThinArc;
+
+    use core::fmt::Display;
+    use core::pin::Pin;
+    use pin_queue::{id, PinQueue};
+
+    type MyTypes = dyn pin_queue::Types<
+        Id = id::Checked,
+        Key = Key,
+        Pointer = ThinArc<ThisIsAReallyLongTypeName<dyn Display>>,
+    >;
+    pin_project_lite::pin_project!(
+        struct ThisIsAReallyLongTypeName<V: ?Sized> {
+            #[pin]
+            intrusive: pin_queue::Intrusive<MyTypes>,
+            value: V,
+        }
+    );
+    impl<V> ThisIsAReallyLongTypeName<V> {
+        pub fn new(value: V) -> Self {
+            Self {
+                intrusive: pin_queue::Intrusive::new(),
+                value,
+            }
+        }
+    }
+    struct Key;
+    impl pin_queue::GetIntrusive<MyTypes> for Key {
+        fn get_intrusive(
+            p: Pin<&ThisIsAReallyLongTypeName<dyn Display>>,
+        ) -> Pin<&pin_queue::Intrusive<MyTypes>> {
+            p.project_ref().intrusive
+        }
+    }
+
+    #[test]
+    fn my_list() {
+        let mut list = PinQueue::<MyTypes>::new(id::Checked::new());
+        list.push_back(ThinArc::pin(ThisIsAReallyLongTypeName::new(1)))
+            .unwrap();
+        list.push_back(ThinArc::pin(ThisIsAReallyLongTypeName::new("hello")))
+            .unwrap();
+
+        assert_eq!(list.pop_front().unwrap().value.to_string(), "1");
+        assert_eq!(list.pop_front().unwrap().value.to_string(), "hello");
+        assert!(list.pop_front().is_none());
+    }
+
+    #[test]
+    fn my_list_push_back_error() {
+        let mut list1 = PinQueue::<MyTypes>::new(id::Checked::new());
+        let mut list2 = PinQueue::<MyTypes>::new(id::Checked::new());
+
+        let val = ThinArc::<ThisIsAReallyLongTypeName<dyn Display>>::pin(
+            ThisIsAReallyLongTypeName::new(1),
+        );
+        list1.push_back(val.clone()).unwrap();
+        list2.push_back(val).unwrap_err();
+    }
+
+    #[test]
+    fn my_list_push_back_same_error() {
+        let mut list = PinQueue::<MyTypes>::new(id::Checked::new());
+
+        let val = ThinArc::<ThisIsAReallyLongTypeName<dyn Display>>::pin(
+            ThisIsAReallyLongTypeName::new(1),
+        );
+        list.push_back(val.clone()).unwrap();
+        list.push_back(val).unwrap_err();
+    }
+}

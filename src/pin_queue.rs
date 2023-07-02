@@ -186,10 +186,9 @@ fn raw_waker<W: ThinWake + ?Sized + Send + Sync + 'static>(waker: Pin<ThinArc<W>
 #[cfg(test)]
 mod tests {
     use crate::ThinArc;
-    use once_cell::sync::Lazy;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use std::task::{Context, Waker};
 
     // aliases
@@ -223,32 +222,46 @@ mod tests {
         }
     }
 
-    // global queue
-    static QUEUE: Lazy<Mutex<PinQueue>> =
-        Lazy::new(|| Mutex::new(PinQueue::new(pin_queue::id::Checked::new())));
-
     #[test]
     fn test() {
+        // global queue
+        static QUEUE: OnceLock<Mutex<PinQueue>> = OnceLock::new();
+        QUEUE
+            .set(Mutex::new(PinQueue::new(pin_queue::id::Checked::new())))
+            .unwrap();
+
         // spawn()
         let task1 = ThinArc::pin(Node::new(async {
             println!("1");
         }));
-        QUEUE.lock().unwrap().push_back(task1).unwrap();
+        QUEUE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push_back(task1)
+            .unwrap();
 
         let task2 = ThinArc::pin(Node::new(async {
             println!("2");
         }));
-        QUEUE.lock().unwrap().push_back(task2).unwrap();
+        QUEUE
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push_back(task2)
+            .unwrap();
 
         // waker
         impl crate::pin_queue::ThinWake for DynNode {
             fn wake(task: Pin<ThinArc<DynNode>>) {
-                let _ = QUEUE.lock().unwrap().push_back(task);
+                let _ = QUEUE.get().unwrap().lock().unwrap().push_back(task);
             }
         }
 
         // worker
-        while let Some(task) = QUEUE.lock().unwrap().pop_front() {
+        while let Some(task) = QUEUE.get().unwrap().lock().unwrap().pop_front() {
             let waker = Waker::from(task.clone());
             let mut cx = Context::from_waker(&waker);
             let mut fut = task.as_ref().project_ref().value.lock();
